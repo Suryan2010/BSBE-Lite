@@ -9,58 +9,57 @@ SAMPLER2D(s_MatTexture, 0);
 SAMPLER2D(s_SeasonsTexture, 1);
 SAMPLER2D(s_LightMapTexture, 2);
 
-const float pi = 3.1415926;
-const float tau = 6.28318531;
+#include "../../common.glsl"
 
-// bayer dither by Jodie
-// used it for reduce strange color banding
-float Bayer2(vec2 a) {
-    a = floor(a);
-    return fract(dot(a, vec2(0.5, a.y * 0.75)));
+float cwav(vec2 pos){
+	float wave = (1.0 - noise2d(pos * 1.3 - ViewPositionAndTime.w * 1.5)) + noise2d(pos + ViewPositionAndTime.w);
+	return wave;
+}
+vec3 calcnw(vec3 n,vec2 cpos){
+	float w1 = cwav(cpos);
+	float w2 = cwav(vec2(cpos.x - 0.02, cpos.y));
+	float w3 = cwav(vec2(cpos.x, cpos.y - 0.02));
+	float dx = w1 - w2;
+	float dy = w1 - w3;
+	vec3 wn = normalize(vec3(dx, dy, 1.0)) * 0.5 + 0.5;
+	mat3 tbn = mat3(abs(n).y + n.z, 0.0, -n.x, 0.0, -abs(n).x - abs(n).z, abs(n).y, n);
+		wn = wn * 2.0 - 1.0;
+		wn = normalize(mul(wn, tbn));
+	return wn;
 }
 
-#define Bayer4(a) (Bayer2(0.5 * (a)) * 0.25 + Bayer2(a))
-#define Bayer8(a) (Bayer4(0.5 * (a)) * 0.25 + Bayer2(a))
-#define Bayer16(a) (Bayer8(0.5 * (a)) * 0.25 + Bayer2(a))
-#define Bayer32(a) (Bayer16(0.5 * (a)) * 0.25 + Bayer2(a))
-#define Bayer64(a) (Bayer32(0.5 * (a)) * 0.25 + Bayer2(a))
-
-// https://github.com/bWFuanVzYWth/OriginShader
-float fogTime(float fogColorG){
-    return clamp(((349.305545 * fogColorG - 159.858192) * fogColorG + 30.557216) * fogColorG - 1.628452, -1.0, 1.0);
+float fschlick(float f0, float ndv){
+	return f0 + (1.0 - f0) * sqr5(1.0 - ndv);
+}
+vec4 reflection(vec4 diff, vec3 wpos, vec3 n, vec3 lsc, vec2 uv1, float dfog, float nfog, float rain){
+	vec3 rv = reflect(normalize(wpos), n);
+	vec3 vdir = normalize(-wpos);
+	float ndv = max0(dot(n, vdir));
+	float zen = max0(rv.y) * 1.2;
+	float fresnel = fschlick(0.5, ndv) * uv1.y;
+	diff = mix(diff,vec4_splat(0.0),uv1.y);
+	vec3 skyc = sr(rv,FogColor.rgb,dfog,nfog,rain,FogAndDistanceControl.x);
+	diff = mix(diff, vec4(skyc + (lsc * 0.5), 1.0), fresnel);
+		rv = rv / rv.y;
+		fresnel = fschlick(0.3, ndv) * uv1.y;
+	diff = mix(diff, vec4(ccc(FogColor.rgb,dfog,nfog,rain), 1.0), cmap(rv.xz,ViewPositionAndTime.w,rain) * zen * fresnel);
+	float ndh = max0(dot(n, normalize(vdir + vec3(-0.98, 0.173, 0.0))));
+	diff += pow(ndh, 230.0) * vec4(skyc, 1.0) * dfog;
+	diff.rgb *= max(uv1.x, smoothstep(0.9,0.94,uv1.y) * 0.7 + 0.3);
+	return diff;
 }
 
-float getLum(vec3 color){
-    return dot(color, vec3(0.2125, 0.7154, 0.0721));
-}
-
-vec3 linColor(vec3 color){
-    return pow(color, vec3(2.2, 2.2, 2.2));
-}
-
-vec3 saturation(vec3 color, float sat){
-    float gray = getLum(color);
-    return mix(vec3(gray, gray, gray), color, sat);
-}
-
-vec3 jodieTonemap(vec3 c){
-    vec3 tc = c / (c + 1.0);
-    return mix(c / (getLum(c) + 1.0), tc, tc);
-}
-
-vec3 sunColor(float sunAngle){
-    sunAngle = clamp(sin(sunAngle) + 0.1, 0.0, 1.0);
-    return vec3((1.0 - sunAngle) + sunAngle, sunAngle, sunAngle * sunAngle) * exp2(log2(sunAngle) * 0.6);
-}
-
-vec3 moonColor(float sunAngle){
-    sunAngle = clamp(-sin(sunAngle), 0.0, 1.0);
-    return vec3((1.0 - sunAngle) * 0.2 + sunAngle, sunAngle, sunAngle) * exp2(log2(sunAngle) * 0.6) * 0.05;
-}
-
-vec3 zenithColor(float sunAngle){
-    sunAngle = clamp(sin(sunAngle), 0.0, 1.0);
-    return vec3(0.0, sunAngle * 0.13 + 0.003, sunAngle * 0.5 + 0.01);
+vec3 illum(vec3 diff, vec3 n, vec3 lsc, vec2 uv1, vec2 uv0, float lmb, float rain){
+	float dusk = min(smoothstep(0.3, 0.5, lmb), smoothstep(1.0, 0.8, lmb)) * (1.0 - rain);
+	float night = saturate(smoothstep(1.0, 0.2, lmb) * 1.5);
+	float smap = mix(mix(mix(1.0, 0.2, max0(abs(n.x))), 0.0, smoothstep(0.94, 0.92, uv1.y)), 0.0, rain);
+		smap = mix(smap, 1.0, smoothstep(lmb * uv1.y, 1.0, uv1.x));
+	vec3 almap = texture2D(s_LightMapTexture, vec2(0.0, uv1.y)).rgb * 0.2;
+		almap += float(texture2DLod(s_MatTexture, uv0, 0.0).a > 0.91 && texture2DLod(s_MatTexture, uv0, 0.0).a < 0.93) * 3.0;
+		almap += lsc;
+	vec3 ambc = mix(mix(vec3(1.1, 1.1, 0.8), vec3(1.0, 0.5, 0.0), dusk), vec3(0.05, 0.15, 0.4), night) * smap;
+		almap += ambc;
+	return diff * almap;
 }
 
 void main() {
@@ -83,7 +82,7 @@ void main() {
             texture2D(s_SeasonsTexture, v_color0.xy).rgb * 2.0, v_color0.b);
     diffuse.rgb *= v_color0.aaa;
 #else
-    diffuse *= v_color0;
+	diffuse *= v_color0;
 #endif
 #endif
 
@@ -91,37 +90,41 @@ void main() {
     diffuse.a = 1.0;
 #endif
 
-        diffuse.rgb = linColor(diffuse.rgb);
+	diffuse.rgb = tl(diffuse.rgb);
 
-    float rain = smoothstep(0.6, 0.3, FogAndDistanceControl.x);
-    float lightVis = texture2D(s_LightMapTexture, vec2(0.0, 1.0)).r;
+	bool waterd = false;
+#ifdef TRANSPARENT
+	waterd = v_color0.a > 0.4 && v_color0.a < 0.6;
+#endif
 
-    vec3 fnormal = normalize(cross(dFdx(v_position), dFdy(v_position)));
-    float sunAngle = fogTime(FogColor.g);
-    vec3 sunPos = normalize(vec3(cos(sunAngle), sin(sunAngle), 0.0));
-    vec3 lightPos = sunPos.y > 0.0 ? sunPos : -sunPos;
-    vec3 ambLight = texture2D(s_LightMapTexture, vec2(0.0, v_lightmapUV.y)).rgb * 0.2;
-        ambLight += float(texture2DLod(s_MatTexture, v_texcoord0, 0.0).a > 0.91 && texture2DLod(s_MatTexture, v_texcoord0, 0.0).a < 0.93) * 3.0;
-        ambLight += vec3(1.0, 0.8, 0.6) * max(v_lightmapUV.x * smoothstep(lightVis * v_lightmapUV.y, 1.0, v_lightmapUV.x), v_lightmapUV.x * rain * v_lightmapUV.y);
+	vec3 n = normalize(cross(dFdx(v_position.xyz), dFdy(v_position.xyz)));
+	float lmb = texture2D(s_LightMapTexture, vec2(0, 1)).r;
+	float rain = smoothstep(.6,.3,FogAndDistanceControl.x);
+	float nfog = pow(saturate(1.-FogColor.r*1.5),1.2);
+	float dfog = saturate((FogColor.r-.15)*1.25)*(1.-FogColor.b);
+	float bls = max(v_lightmapUV.x * smoothstep(lmb * v_lightmapUV.y, 1.0, v_lightmapUV.x), v_lightmapUV.x * rain * v_lightmapUV.y);
+	vec3 lsc = vec3(1.0, 0.35, 0.0) * bls + sqr5(bls);
+	diffuse.rgb = illum(diffuse.rgb, n, lsc, v_lightmapUV, v_texcoord0, lmb, rain);
+	if(waterd){
+		n = calcnw(n,v_position.xz);
+		diffuse = reflection(diffuse, v_worldpos, n, lsc, v_lightmapUV, dfog, nfog, rain);
+	}
+	if(FogAndDistanceControl.x == 0.0){
+		float caus = cwav(v_position.xz);
+		if(!waterd) diffuse.rgb = vec3(0.3, 0.6, 1.0) * diffuse.rgb + diffuse.rgb * max0(caus) * v_lightmapUV.y;
+		diffuse.rgb += diffuse.rgb * (v_lightmapUV.x * v_lightmapUV.x) * (1.0 - v_lightmapUV.y);
+	}
+	vec3 newfc = sr(normalize(v_worldpos),FogColor.rgb,dfog,nfog,rain,FogAndDistanceControl.x);
+	diffuse.rgb = mix(diffuse.rgb, newfc, v_fog.a);
 
-    float shadowMap = mix(mix(mix(clamp(dot(lightPos, fnormal), 0.0, 1.0) * (2.0 - clamp(lightPos.y, 0.0, 1.0)), 0.0, smoothstep(0.87, 0.84, v_lightmapUV.y)), 0.0, rain), 1.0, smoothstep(lightVis * v_lightmapUV.y, 1.0, v_lightmapUV.x));
-        ambLight += (mix(sunColor(sunAngle) * vec3(1.2, 1.0, 0.8), linColor(FogColor.rgb), rain) * shadowMap);
-        diffuse.rgb = diffuse.rgb * ambLight;
+	vec3 curr = unchartedModified(diffuse.rgb * 5.0);
+	vec3 ws = 1.0 / unchartedModified(vec3_splat(12.0));
+		curr *= ws;
+	diffuse.rgb = pow(curr, vec3_splat(1.0 / 2.2));
+	diffuse.rgb = saturate(diffuse.rgb);
 
-    vec3 npos = normalize(v_worldpos);
-    vec3 fogColor = mix(zenithColor(sunAngle), saturation(sunColor(sunAngle) + moonColor(sunAngle), 0.5), exp(-clamp(npos.y, 0.0, 1.0) * 4.0));
-        fogColor += sunColor(sunAngle) * exp(-distance(npos, sunPos) * 2.0) * exp(-clamp(npos.y, 0.0, 1.0) * 2.0) * 5.0;
-        fogColor += moonColor(sunAngle) * exp(-distance(npos, -sunPos) * 2.0) * exp(-clamp(npos.y, 0.0, 1.0) * 2.0) * 5.0;
-        fogColor = mix(fogColor, linColor(FogColor.rgb), max(step(FogAndDistanceControl.x, 0.0), rain));
-
-    if(FogAndDistanceControl.x > 0.0){
-        diffuse.rgb = mix(diffuse.rgb, zenithColor(sunAngle) * 2.0, clamp(length(-v_worldpos) * 0.01, 0.0, 1.0) * 0.01);
-    }
-        diffuse.rgb = mix(diffuse.rgb, fogColor, (FogAndDistanceControl.x <= 0.0) ?  (v_fog.a * v_fog.a) : v_fog.a);
-        diffuse.rgb = diffuse.rgb * (Bayer64(gl_FragCoord.xy) * 0.5 + 0.5);
-        diffuse.rgb = jodieTonemap(diffuse.rgb * 5.0);
-        diffuse.rgb = saturation(diffuse.rgb, 1.1);
-        diffuse.rgb = pow(diffuse.rgb, vec3(1.0 / 2.2, 1.0 / 2.2, 1.0 / 2.2));
+    float gray = luma(diffuse.rgb);
+    diffuse.rgb = mix(vec3_splat(gray), diffuse.rgb, 1.1);
 
     gl_FragColor = diffuse;
 }
